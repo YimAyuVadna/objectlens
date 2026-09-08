@@ -14,5 +14,19 @@
 .externalNativeBuild
 .cxx
 local.properties
+*.properties
+!gradle.properties
 .env
-debug.keystore
+.env.*
+!.env.example
+secrets.properties
+google-services.json
+GoogleService-Info.plist
+
+# Keystores & Signing keys
+*.keystore
+*.jks
+*.key
+*.pem
+*.p12
+*.pfx
