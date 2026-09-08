@@ -1,0 +1,7 @@
+{
+  "name": "ObjectLens",
+  "description": "On-device AI object recognition mobile app with real-time camera detection, bounding boxes, encyclopedic object details, scan capture, and history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
