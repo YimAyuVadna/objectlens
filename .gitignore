@@ -30,3 +30,11 @@ GoogleService-Info.plist
 *.pem
 *.p12
 *.pfx
+
+# Binaries & APKs
+*.apk
+*.aab
+
+# Agent & workspace artifacts
+.agent/
+.claude/

@@ -58,11 +58,11 @@ class LearnedObjectManager(
     }
 
     /**
-     * Checks if the given crop matches any learned object.
+     * Checks if the given crop matches any custom user-taught object.
      * Evaluates against all exemplar view angles of each object.
-     * Returns the best match if similarity >= [threshold], otherwise null.
+     * User-taught objects require threshold >= [threshold] (calibrated 0.70f).
      */
-    fun findMatch(cropBitmap: Bitmap, threshold: Float = DEFAULT_MATCH_THRESHOLD): LearnedMatch? {
+    fun findUserTaughtMatch(cropBitmap: Bitmap, threshold: Float = 0.70f): LearnedMatch? {
         if (!isLoaded || learnedCache.isEmpty()) return null
 
         val queryVector = VisualFeatureExtractor.extractFeatureVector(cropBitmap)
@@ -71,7 +71,9 @@ class LearnedObjectManager(
 
         for ((_, pair) in learnedCache) {
             val (entity, exemplars) = pair
-            // Test all exemplar angles for this object
+            // ONLY match custom objects taught by a user (never pre_* synthetic items)
+            if (entity.id.startsWith("pre_")) continue
+
             for (exemplar in exemplars) {
                 val sim = VisualFeatureExtractor.cosineSimilarity(queryVector, exemplar)
                 if (sim > maxSim) {
@@ -81,6 +83,14 @@ class LearnedObjectManager(
             }
         }
         return bestMatch
+    }
+
+    /**
+     * Checks if the given crop matches any learned object.
+     * Evaluates user-taught objects.
+     */
+    fun findMatch(cropBitmap: Bitmap, threshold: Float = DEFAULT_MATCH_THRESHOLD): LearnedMatch? {
+        return findUserTaughtMatch(cropBitmap, threshold)
     }
 
     /**

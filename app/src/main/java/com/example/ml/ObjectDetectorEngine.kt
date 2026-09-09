@@ -2,7 +2,9 @@ package com.example.ml
 
 import android.graphics.Bitmap
 import android.graphics.Matrix
+import android.util.Log
 import androidx.camera.core.ImageProxy
+import com.example.data.local.LabelTier
 import com.example.data.local.ObjectKnowledgeBase
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.vision.common.InputImage
@@ -78,7 +80,7 @@ class ObjectDetectorEngine {
 
     companion object {
         private const val TRACK_GRACE_FRAMES = 3
-        private const val CACHE_EXPIRATION_MS = 2500L
+        private const val CACHE_EXPIRATION_MS = 800L
     }
 
     suspend fun initialize() = withContext(Dispatchers.Default) {
@@ -90,7 +92,7 @@ class ObjectDetectorEngine {
         mlkitStreamDetector = ObjectDetection.getClient(streamOptions)
 
         val labelerOptions = ImageLabelerOptions.Builder()
-            .setConfidenceThreshold(0.30f)
+            .setConfidenceThreshold(0.20f)
             .build()
         mlkitLabeler = ImageLabeling.getClient(labelerOptions)
 
@@ -174,14 +176,7 @@ class ObjectDetectorEngine {
                     try {
                         val mlkitObjects = if (detectTask.isSuccessful) detectTask.result else emptyList()
 
-                    if (mlkitObjects.isEmpty()) {
-                        // Clean up stale crop bitmaps when no objects in view
-                        activeCropMap.clear()
-                        onResult(emptyList())
-                        return@addOnCompleteListener
-                    }
-
-                    // Lazy bitmap conversion: only decode & rotate if an uncached object needs a crop
+                    // Lazy bitmap conversion: only decode & rotate if needed
                     var lazyOrientedBitmap: Bitmap? = null
                     var attemptedBitmapConversion = false
 
@@ -210,6 +205,7 @@ class ObjectDetectorEngine {
                     val now = System.currentTimeMillis()
                     val frameDetections = mutableListOf<DetectedObject>()
 
+                    // 1. Process localized bounding boxes from ML Kit Object Detector
                     for (obj in mlkitObjects) {
                         val box = obj.boundingBox
                         val trackId = obj.trackingId ?: nextTrackingId++
@@ -226,7 +222,7 @@ class ObjectDetectorEngine {
                         val normalizedBottom = box.bottom.toFloat() / imageHeight
 
                         if (cached != null && (now - cached.timestamp < CACHE_EXPIRATION_MS)) {
-                            // Fast path: use cached classification for smooth 30-60 FPS tracking (0ms bitmap cost)
+                            // Fast path: use cached classification for smooth tracking
                             frameDetections.add(
                                 DetectedObject(
                                     id = detectionId,
@@ -245,117 +241,174 @@ class ObjectDetectorEngine {
                         } else {
                             val orientedBitmap = getOrientedBitmap()
                             if (orientedBitmap != null && !orientedBitmap.isRecycled) {
-                            // Extract crop for precision classification and visual memory
-                            val cropLeft = box.left.coerceIn(0, orientedBitmap.width - 1)
-                            val cropTop = box.top.coerceIn(0, orientedBitmap.height - 1)
-                            val cropW = box.width().coerceIn(10, orientedBitmap.width - cropLeft)
-                            val cropH = box.height().coerceIn(10, orientedBitmap.height - cropTop)
+                                // Extract crop for precision classification and visual memory
+                                val cropLeft = box.left.coerceIn(0, orientedBitmap.width - 1)
+                                val cropTop = box.top.coerceIn(0, orientedBitmap.height - 1)
+                                val cropW = box.width().coerceIn(10, orientedBitmap.width - cropLeft)
+                                val cropH = box.height().coerceIn(10, orientedBitmap.height - cropTop)
 
-                            val cropBitmap = try {
-                                Bitmap.createBitmap(orientedBitmap, cropLeft, cropTop, cropW, cropH)
-                            } catch (_: Exception) {
-                                null
+                                val cropBitmap = try {
+                                    Bitmap.createBitmap(orientedBitmap, cropLeft, cropTop, cropW, cropH)
+                                } catch (_: Exception) {
+                                    null
+                                }
+
+                                if (cropBitmap != null) {
+                                    activeCropMap[detectionId] = cropBitmap
+
+                                    // Step 1: Check On-Device Visual Memory ONLY for user-taught custom objects
+                                    val userMatch = learnedObjectManager?.findUserTaughtMatch(cropBitmap)
+
+                                    if (userMatch != null) {
+                                        val entity = userMatch.entity
+                                        val conf = userMatch.similarity.coerceIn(0.75f, 0.99f)
+
+                                        classificationCache[trackId] = CachedClassification(
+                                            label = entity.name.lowercase(),
+                                            displayName = entity.name,
+                                            category = entity.category,
+                                            confidence = conf,
+                                            isLearned = true,
+                                            timestamp = now
+                                        )
+
+                                        frameDetections.add(
+                                            DetectedObject(
+                                                id = detectionId,
+                                                label = entity.name.lowercase(),
+                                                displayName = entity.name,
+                                                confidence = conf,
+                                                category = entity.category,
+                                                normalizedLeft = normalizedLeft.coerceIn(0.02f, 0.95f),
+                                                normalizedTop = normalizedTop.coerceIn(0.02f, 0.95f),
+                                                normalizedRight = normalizedRight.coerceIn(0.05f, 0.98f),
+                                                normalizedBottom = normalizedBottom.coerceIn(0.05f, 0.98f),
+                                                trackingId = trackId,
+                                                isLearned = true
+                                            )
+                                        )
+
+                                        learnedObjectManager?.recordRecognition(entity)
+                                    } else {
+                                        // Step 2: Classify cropped sub-bitmap with ML Kit ImageLabeler
+                                        val cropInput = InputImage.fromBitmap(cropBitmap, 0)
+                                        val labelTask = labeler.process(cropInput)
+
+                                        try {
+                                            val labels = Tasks.await(labelTask)
+                                            val cropCandidates = labels.map { it.text to it.confidence }
+                                            val objCandidates = obj.labels.map { it.text to it.confidence }
+
+                                            val resolved = ObjectKnowledgeBase.resolveBestInfo(cropCandidates, objCandidates)
+                                            val info = resolved.info
+                                            val conf = resolved.confidence
+
+                                            val adjustedConf = labelMemory?.adjustConfidence(conf, info.id, emptyList()) ?: conf
+
+                                            if (adjustedConf >= minConfidence) {
+                                                classificationCache[trackId] = CachedClassification(
+                                                    label = info.id,
+                                                    displayName = info.name,
+                                                    category = info.category,
+                                                    confidence = adjustedConf,
+                                                    isLearned = false,
+                                                    timestamp = now
+                                                )
+
+                                                frameDetections.add(
+                                                    DetectedObject(
+                                                        id = detectionId,
+                                                        label = info.id,
+                                                        displayName = info.name,
+                                                        confidence = adjustedConf,
+                                                        category = info.category,
+                                                        normalizedLeft = normalizedLeft.coerceIn(0.02f, 0.95f),
+                                                        normalizedTop = normalizedTop.coerceIn(0.02f, 0.95f),
+                                                        normalizedRight = normalizedRight.coerceIn(0.05f, 0.98f),
+                                                        normalizedBottom = normalizedBottom.coerceIn(0.05f, 0.98f),
+                                                        trackingId = trackId,
+                                                        isLearned = false
+                                                    )
+                                                )
+                                            }
+                                        } catch (_: Exception) {}
+                                    }
+                                }
                             }
+                        }
+                    }
 
-                            if (cropBitmap != null) {
-                                activeCropMap[detectionId] = cropBitmap
+                    // 2. Primary Center Viewfinder ROI:
+                    // If no object is detected near the center reticle, analyze the center region where the user aims
+                    val hasCenterObject = frameDetections.any {
+                        it.normalizedLeft <= 0.60f && it.normalizedRight >= 0.40f &&
+                        it.normalizedTop <= 0.60f && it.normalizedBottom >= 0.40f
+                    }
 
-                                // Step 1: Check On-Device Visual Memory (Learned Objects)
-                                val learnedMatch = learnedObjectManager?.findMatch(cropBitmap)
+                    if (!hasCenterObject) {
+                        val orientedBitmap = getOrientedBitmap()
+                        if (orientedBitmap != null && !orientedBitmap.isRecycled) {
+                            val roiW = (orientedBitmap.width * 0.50f).toInt().coerceAtLeast(60)
+                            val roiH = (orientedBitmap.height * 0.50f).toInt().coerceAtLeast(60)
+                            val roiLeft = ((orientedBitmap.width - roiW) / 2).coerceIn(0, orientedBitmap.width - roiW)
+                            val roiTop = ((orientedBitmap.height - roiH) / 2).coerceIn(0, orientedBitmap.height - roiH)
 
-                                if (learnedMatch != null) {
-                                    // MATCHED LEARNED OBJECT!
-                                    val entity = learnedMatch.entity
-                                    val conf = learnedMatch.similarity.coerceIn(0.70f, 0.99f)
+                            val centerBitmap = try {
+                                Bitmap.createBitmap(orientedBitmap, roiLeft, roiTop, roiW, roiH)
+                            } catch (_: Exception) { null }
 
-                                    classificationCache[trackId] = CachedClassification(
-                                        label = entity.name.lowercase(),
-                                        displayName = entity.name,
-                                        category = entity.category,
-                                        confidence = conf,
-                                        isLearned = true,
-                                        timestamp = now
-                                    )
+                            if (centerBitmap != null) {
+                                val centerId = "live_center_viewfinder"
+                                activeCropMap[centerId] = centerBitmap
 
+                                // Check user-taught custom objects first
+                                val userMatch = learnedObjectManager?.findUserTaughtMatch(centerBitmap)
+                                if (userMatch != null) {
+                                    val entity = userMatch.entity
+                                    val conf = userMatch.similarity.coerceIn(0.75f, 0.99f)
                                     frameDetections.add(
                                         DetectedObject(
-                                            id = detectionId,
+                                            id = centerId,
                                             label = entity.name.lowercase(),
                                             displayName = entity.name,
                                             confidence = conf,
                                             category = entity.category,
-                                            normalizedLeft = normalizedLeft.coerceIn(0.02f, 0.95f),
-                                            normalizedTop = normalizedTop.coerceIn(0.02f, 0.95f),
-                                            normalizedRight = normalizedRight.coerceIn(0.05f, 0.98f),
-                                            normalizedBottom = normalizedBottom.coerceIn(0.05f, 0.98f),
-                                            trackingId = trackId,
+                                            normalizedLeft = 0.22f,
+                                            normalizedTop = 0.22f,
+                                            normalizedRight = 0.78f,
+                                            normalizedBottom = 0.78f,
+                                            trackingId = 9999,
                                             isLearned = true
                                         )
                                     )
-
-                                    // Record passive recognition timestamp without corrupting feature vectors with live drift
                                     learnedObjectManager?.recordRecognition(entity)
                                 } else {
-                                    // Step 2: Classify cropped sub-bitmap with ImageLabeler
-                                    val cropInput = InputImage.fromBitmap(cropBitmap, 0)
-                                    val labelTask = labeler.process(cropInput)
-
+                                    // Classify Center Viewfinder with ImageLabeler
                                     try {
-                                        val labels = Tasks.await(labelTask)
-                                        val bestLabel = labels.maxByOrNull { it.confidence }
+                                        val centerInput = InputImage.fromBitmap(centerBitmap, 0)
+                                        val labels = Tasks.await(labeler.process(centerInput))
+                                        val candidates = labels.map { it.text to it.confidence }
+                                        val resolved = ObjectKnowledgeBase.resolveBestInfo(candidates, emptyList())
+                                        val info = resolved.info
+                                        val conf = resolved.confidence
 
-                                        val labelText: String
-                                        val displayName: String
-                                        val conf: Float
-                                        val category: String
+                                        val adjustedConf = labelMemory?.adjustConfidence(conf, info.id, emptyList()) ?: conf
 
-                                        if (bestLabel != null && bestLabel.confidence >= 0.35f) {
-                                            labelText = bestLabel.text.lowercase()
-                                            val info = ObjectKnowledgeBase.getObjectInfo(labelText)
-                                            displayName = info.name
-                                            category = info.category
-                                            conf = bestLabel.confidence
-                                        } else {
-                                            val objLabel = obj.labels.maxByOrNull { it.confidence }
-                                            if (objLabel != null) {
-                                                labelText = objLabel.text.lowercase()
-                                                val info = ObjectKnowledgeBase.getObjectInfo(labelText)
-                                                displayName = info.name
-                                                category = info.category
-                                                conf = objLabel.confidence
-                                            } else {
-                                                labelText = "object"
-                                                displayName = "Object"
-                                                category = "General"
-                                                conf = 0.50f
-                                            }
-                                        }
-
-                                        // Apply label memory boost
-                                        val adjustedConf = labelMemory?.adjustConfidence(conf, labelText, emptyList()) ?: conf
-
-                                        if (adjustedConf >= minConfidence) {
-                                            classificationCache[trackId] = CachedClassification(
-                                                label = labelText,
-                                                displayName = displayName,
-                                                category = category,
-                                                confidence = adjustedConf,
-                                                isLearned = false,
-                                                timestamp = now
-                                            )
-
+                                        // Only show center ROI detection if it resolved to a specific object (Tier 1)
+                                        // or if confidence is high, preventing generic scene labels from showing as center boxes
+                                        if (adjustedConf >= minConfidence && resolved.tier == LabelTier.SPECIFIC_OBJECT) {
                                             frameDetections.add(
                                                 DetectedObject(
-                                                    id = detectionId,
-                                                    label = labelText,
-                                                    displayName = displayName,
+                                                    id = centerId,
+                                                    label = info.id,
+                                                    displayName = info.name,
                                                     confidence = adjustedConf,
-                                                    category = category,
-                                                    normalizedLeft = normalizedLeft.coerceIn(0.02f, 0.95f),
-                                                    normalizedTop = normalizedTop.coerceIn(0.02f, 0.95f),
-                                                    normalizedRight = normalizedRight.coerceIn(0.05f, 0.98f),
-                                                    normalizedBottom = normalizedBottom.coerceIn(0.05f, 0.98f),
-                                                    trackingId = trackId,
+                                                    category = info.category,
+                                                    normalizedLeft = 0.22f,
+                                                    normalizedTop = 0.22f,
+                                                    normalizedRight = 0.78f,
+                                                    normalizedBottom = 0.78f,
+                                                    trackingId = 9999,
                                                     isLearned = false
                                                 )
                                             )
@@ -365,19 +418,19 @@ class ObjectDetectorEngine {
                             }
                         }
                     }
-                }
-
-                    // Prune active crops for objects no longer in frame
-                    val activeIds = frameDetections.map { it.id }.toSet()
-                    activeCropMap.keys.retainAll(activeIds)
 
                     // Apply NMS and temporal smoothing
                     val nms = applyNMS(frameDetections)
                     val crossNms = applyCrossLabelNMS(nms)
                     val smoothed = smoothDetections(crossNms)
+                    val finalDetections = applyCrossLabelNMS(smoothed, 0.60f)
 
-                    if (smoothed.isNotEmpty()) {
-                        labelMemory?.recordSightings(smoothed.map { it.label })
+                    // Prune active crops for objects no longer in frame
+                    val activeIds = finalDetections.map { it.id }.toSet()
+                    activeCropMap.keys.retainAll(activeIds)
+
+                    if (finalDetections.isNotEmpty()) {
+                        labelMemory?.recordSightings(finalDetections.map { it.label })
                     }
 
                     // Metrics
@@ -391,7 +444,7 @@ class ObjectDetectorEngine {
                     }
                     lastProcessTime = System.currentTimeMillis()
 
-                    onResult(smoothed)
+                    onResult(finalDetections)
                 } catch (_: Exception) {
                     // Guard against any unexpected frame processing errors
                 } finally {
@@ -593,8 +646,8 @@ class ObjectDetectorEngine {
                     if (cropBitmap != null) {
                         activeCropMap[detectionId] = cropBitmap
 
-                        // 1. Check visual memory
-                        val learnedMatch = learnedObjectManager?.findMatch(cropBitmap)
+                        // 1. Check visual memory (user-taught objects only)
+                        val learnedMatch = learnedObjectManager?.findUserTaughtMatch(cropBitmap)
                         if (learnedMatch != null) {
                             results.add(
                                 DetectedObject(
@@ -613,18 +666,28 @@ class ObjectDetectorEngine {
                             continue
                         }
 
-                        // 2. Crop labeling
+                        // 2. Crop labeling + ML Kit detector labels resolved via ObjectKnowledgeBase
                         try {
                             val labels = Tasks.await(labeler.process(InputImage.fromBitmap(cropBitmap, 0)))
-                            val best = labels.maxByOrNull { it.confidence }
-                            if (best != null && best.confidence >= minConfidence) {
-                                val info = ObjectKnowledgeBase.getObjectInfo(best.text)
+                            val cropCandidates = labels.map { it.text to it.confidence }
+                            val objCandidates = obj.labels.map { it.text to it.confidence }
+
+                            Log.d("ObjectLens", "STATIC crop labels: ${cropCandidates.joinToString { "${it.first}(${String.format("%.2f", it.second)})" }}")
+                            Log.d("ObjectLens", "STATIC obj  labels: ${objCandidates.joinToString { "${it.first}(${String.format("%.2f", it.second)})" }}")
+
+                            val resolved = ObjectKnowledgeBase.resolveBestInfo(cropCandidates, objCandidates)
+                            val info = resolved.info
+                            val conf = resolved.confidence
+
+                            Log.d("ObjectLens", "STATIC resolved → ${info.name} (${info.id}) conf=${String.format("%.2f", conf)} cat=${info.category}")
+
+                            if (conf >= minConfidence) {
                                 results.add(
                                     DetectedObject(
                                         id = detectionId,
-                                        label = best.text.lowercase(),
+                                        label = info.id,
                                         displayName = info.name,
-                                        confidence = best.confidence,
+                                        confidence = conf,
                                         category = info.category,
                                         normalizedLeft = box.left.toFloat() / imageWidth,
                                         normalizedTop = box.top.toFloat() / imageHeight,
@@ -639,24 +702,57 @@ class ObjectDetectorEngine {
                     }
 
                     // Fallback to detector label
-                    val objLabel = obj.labels.maxByOrNull { it.confidence }
-                    if (objLabel != null && objLabel.confidence >= minConfidence) {
-                        val info = ObjectKnowledgeBase.getObjectInfo(objLabel.text)
-                        results.add(
-                            DetectedObject(
-                                id = detectionId,
-                                label = objLabel.text.lowercase(),
-                                displayName = info.name,
-                                confidence = objLabel.confidence,
-                                category = info.category,
-                                normalizedLeft = box.left.toFloat() / imageWidth,
-                                normalizedTop = box.top.toFloat() / imageHeight,
-                                normalizedRight = box.right.toFloat() / imageWidth,
-                                normalizedBottom = box.bottom.toFloat() / imageHeight,
-                                isLearned = false
+                    val objCandidates = obj.labels.map { it.text to it.confidence }
+                    if (objCandidates.isNotEmpty()) {
+                        val resolved = ObjectKnowledgeBase.resolveBestInfo(emptyList(), objCandidates)
+                        val info = resolved.info
+                        val conf = resolved.confidence
+                        if (conf >= minConfidence) {
+                            results.add(
+                                DetectedObject(
+                                    id = detectionId,
+                                    label = info.id,
+                                    displayName = info.name,
+                                    confidence = conf,
+                                    category = info.category,
+                                    normalizedLeft = box.left.toFloat() / imageWidth,
+                                    normalizedTop = box.top.toFloat() / imageHeight,
+                                    normalizedRight = box.right.toFloat() / imageWidth,
+                                    normalizedBottom = box.bottom.toFloat() / imageHeight,
+                                    isLearned = false
+                                )
                             )
-                        )
+                        }
                     }
+                }
+
+                // If ObjectDetector produced no results for this static photo (e.g. close-up or unboxed item):
+                if (results.isEmpty()) {
+                    try {
+                        val fullInput = InputImage.fromBitmap(bitmap, 0)
+                        val labels = Tasks.await(labeler.process(fullInput))
+                        val candidates = labels.map { it.text to it.confidence }
+                        val resolved = ObjectKnowledgeBase.resolveBestInfo(candidates, emptyList())
+                        if (resolved.confidence >= minConfidence && resolved.tier == LabelTier.SPECIFIC_OBJECT) {
+                            val info = resolved.info
+                            val detectionId = "bitmap_full"
+                            activeCropMap[detectionId] = bitmap
+                            results.add(
+                                DetectedObject(
+                                    id = detectionId,
+                                    label = info.id,
+                                    displayName = info.name,
+                                    confidence = resolved.confidence,
+                                    category = info.category,
+                                    normalizedLeft = 0.05f,
+                                    normalizedTop = 0.05f,
+                                    normalizedRight = 0.95f,
+                                    normalizedBottom = 0.95f,
+                                    isLearned = false
+                                )
+                            )
+                        }
+                    } catch (_: Exception) {}
                 }
 
                 if (results.isNotEmpty()) {
